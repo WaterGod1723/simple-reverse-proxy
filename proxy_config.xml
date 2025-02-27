@@ -14,6 +14,7 @@
     <domain>internal.company.com</domain>
     <domain>local-network.com</domain>
   </directDomains>
+  <!--   可以根据路径添加已有请求的请求头，可以从浏览器中右键copy headers复制过来存到对应文件 -->
   <customHeaders>
     <header domain="www.baidum.com" pathPrefix="/search" headersPath="./appReqHeaders.txt" />
   </customHeaders>
