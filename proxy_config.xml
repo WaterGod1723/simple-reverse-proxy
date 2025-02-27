@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <!-- 默认代理设置 -->
+  <defaultProxy proxyUrl="http://proxy.com:8080" username="ppp" password="pwd" />
+
+  <!-- 特定域名代理设置 -->
+  <proxy domain="baidu.com" proxyUrl="http://proxy1.com:8080" username="ppp" password="pwd"  />
+  <proxy domain="google.com" proxyUrl="http://proxy2.com:8080" username="ppp" password="pwd"  />
+
+  <!-- 不使用代理的域名列表 -->
+  <directDomains>
+    <domain>localhost</domain>
+    <domain>127.0.0.1</domain>
+    <domain>internal.company.com</domain>
+    <domain>local-network.com</domain>
+  </directDomains>
+  <customHeaders>
+    <header domain="www.baidum.com" pathPrefix="/search" headersPath="./appReqHeaders.txt" />
+  </customHeaders>
+</config>
