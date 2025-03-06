@@ -2,15 +2,19 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // ProxyConfig 代理配置结构体
@@ -39,6 +43,7 @@ type ProxyRule struct {
 var config ProxyConfig
 var serverHost string
 var serverPort int
+var uuid int64
 
 func loadConfig(filename string) error {
 	data, err := os.ReadFile(filename)
@@ -149,14 +154,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 查找域名对应的代理规则
 	proxyRule := findProxyRule(targetURL.Host)
 
-	// 创建客户端，禁用自动重定向，我们需要自己处理
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 不自动重定向，返回http.ErrUseLastResponse使客户端返回最后一个响应
-			return http.ErrUseLastResponse
-		},
-	}
-
+	var transport *http.Transport
+	id := atomic.AddInt64(&uuid, 1)
 	// 如果找到代理规则并且设置了代理URL
 	if proxyRule != nil && proxyRule.ProxyURL != "" {
 		proxyURL, err := url.Parse(proxyRule.ProxyURL)
@@ -170,77 +169,36 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			proxyURL.User = url.UserPassword(proxyRule.Username, proxyRule.Password)
 		}
 
-		transport := &http.Transport{
+		transport = &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
 		}
-		client.Transport = transport
-		log.Printf("使用代理 %s 访问 %s", proxyRule.ProxyURL, targetURL.String())
+		log.Printf("id:%d use+proxy %s access %s", id, proxyRule.ProxyURL, targetURL.String())
 	} else {
-		log.Printf("直接访问 %s (不使用代理)", targetURL.String())
+		log.Printf("id:%d no-proxy %s", id, targetURL.String())
 	}
 
-	// 创建请求
-	req, err := http.NewRequest(r.Method, targetPath, r.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("创建请求失败: %v", err), http.StatusInternalServerError)
-		return
+	proxyUtil := &httputil.ReverseProxy{
+		Director: func(r *http.Request) {
+			for _, i := range config.CustomHeaders {
+				if i.Domain == targetURL.Host && strings.HasPrefix(targetURL.Path, i.PathPrefix) {
+					addHeadersFromTxt(i.HeadersPath, r)
+					break
+				}
+			}
+			r.URL = targetURL
+			r.Host = targetURL.Host
+		},
+		Transport: transport,
+		ModifyResponse: func(r *http.Response) error {
+			log.Printf("id:%d response code %d", id, r.StatusCode)
+			return nil
+		},
 	}
 
-	for _, i := range config.CustomHeaders {
-		if i.Domain == targetURL.Host && strings.HasPrefix(targetURL.Path, i.PathPrefix) {
-			addHeadersFromTxt(i.HeadersPath, req)
-			break
-		}
-	}
-
-	// 复制原始请求的头信息
-	for key, values := range r.Header {
-		// 跳过一些特定的头，这些可能会导致问题
-		if key == "Host" || key == "Connection" || key == "Content-Length" {
-			continue
-		}
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-
-	// 设置X-Forwarded-For头
-	req.Header.Set("X-Forwarded-For", r.RemoteAddr)
-
-	// 发送请求
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("代理请求失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	// 检查是否是重定向响应
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		location := resp.Header.Get("Location")
-		if location != "" {
-			// 处理重定向URL
-			newLocation := handleRedirectURL(location)
-			resp.Header.Set("Location", newLocation)
-			log.Printf("重定向: %s -> %s", location, newLocation)
-		}
-	}
-
-	// 复制响应头
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-
-	// 设置状态码
-	w.WriteHeader(resp.StatusCode)
-
-	// 复制响应体
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		log.Printf("复制响应体失败: %v", err)
-	}
+	proxyUtil.ServeHTTP(w, r)
 }
 
 func addHeadersFromTxt(path string, req *http.Request) {
@@ -263,7 +221,58 @@ func addHeadersFromTxt(path string, req *http.Request) {
 	}
 }
 
+func watchConfigChange() {
+	s, err := os.Stat("proxy_config.xml")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	t := s.ModTime()
+	for {
+		time.Sleep(time.Second * 2)
+		s, err := os.Stat("proxy_config.xml")
+		if err != nil {
+			continue
+		}
+		t1 := s.ModTime()
+		if t != t1 {
+			t = t1
+			restart()
+		}
+	}
+}
+
+func restart() {
+	fmt.Println("准备重启...")
+
+	// 获取当前程序的可执行文件路径
+	executable, err := os.Executable()
+	if err != nil {
+		fmt.Println("获取可执行文件路径失败:", err)
+		return
+	}
+
+	// 获取命令行参数，去掉第一个参数（可执行文件路径）
+	args := os.Args[1:]
+
+	// 使用 exec.Command 执行新的进程
+	cmd := exec.Command(executable, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err = cmd.Start()
+	if err != nil {
+		fmt.Println("启动新进程失败:", err)
+		return
+	}
+	fmt.Println("重启成功！")
+
+	// 关闭当前进程
+	os.Exit(0)
+}
+
 func main() {
+	go watchConfigChange()
 	// 设置服务器信息
 	serverHost = "localhost"
 	serverPort = 3000
@@ -278,7 +287,7 @@ func main() {
 
 	// 启动服务器
 	log.Printf("代理服务器启动在 http://%s:%d", serverHost, serverPort)
-	log.Printf("使用示例: http://%s:%d/https://baidu.com/search", serverHost, serverPort)
+	log.Printf("使用示例: http://%s:%d/https://www.baidu.com", serverHost, serverPort)
 	err := http.ListenAndServe(fmt.Sprintf(":%d", serverPort), nil)
 	if err != nil {
 		log.Fatalf("服务器启动失败: %v", err)
